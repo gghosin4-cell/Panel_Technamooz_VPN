@@ -1,6 +1,6 @@
 # main.py
 # ══════════════════════════════════════════════════════════════════════════════
-# Panel Technamooz v1.0.0.0 stable
+# Panel Technamooz v2.0.0.0 Control Plane
 # پنل فوق‌حرفه‌ای و بهینه‌سازی‌شده ساخت و مدیریت کانفیگ VLESS / Trojan / XHTTP
 # توسعه‌یافته توسط تیم Technamooz با مدیریت amirparsa
 # ══════════════════════════════════════════════════════════════════════════════
@@ -31,7 +31,7 @@ if __name__ == "__main__":
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [Technamooz] %(message)s")
 APP_NAME = "Panel Technamooz"
-APP_VERSION = "1.0.0.0"
+APP_VERSION = "2.0.0.0"
 logger = logging.getLogger("Technamooz")
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
@@ -73,6 +73,16 @@ CONFIG = {
     "secret": _load_or_create_secret(),
     "host": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
 }
+
+# The management UI is deliberately not exposed at a predictable `/admin` or
+# `/login` URL.  The segment is derived from a secret and is stable across
+# restarts as long as SECRET_KEY/ADMIN_PATH_SECRET remains stable.
+_admin_path_seed = os.environ.get("ADMIN_PATH_SECRET", "").strip() or CONFIG["secret"]
+_admin_path_digest = hmac.new(_admin_path_seed.encode(), b"technamooz-admin-route-v2", hashlib.sha256).digest()
+ADMIN_ROUTE_TOKEN = base64.urlsafe_b64encode(_admin_path_digest).decode().rstrip("=")[:24]
+ADMIN_ROUTE = f"/control/{ADMIN_ROUTE_TOKEN}"
+ADMIN_LOGIN_PATH = ADMIN_ROUTE
+ADMIN_DASHBOARD_PATH = f"{ADMIN_ROUTE}/dashboard"
 
 TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "false").lower() in {"1", "true", "yes"}
 ALLOWED_PUBLIC_HOSTS = {x.strip().split(":", 1)[0].lower() for x in os.environ.get("ALLOWED_PUBLIC_HOSTS", "").split(",") if x.strip()}
@@ -127,6 +137,7 @@ async def save_state():
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             data = {
+                "schema_version": 2,
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
                 "password_hash": AUTH["password_hash"],
@@ -291,6 +302,7 @@ async def startup():
     http_client = httpx.AsyncClient(timeout=10.0)
     await load_state()
     await ensure_default_link()
+    logger.info("Technamooz Control Plane admin URL: %s", ADMIN_LOGIN_PATH)
 
     from xhttp_siz10 import ensure_reaper
     ensure_reaper()
@@ -832,7 +844,7 @@ def generate_singbox_json(links_list: list[tuple[str, dict]], host: str) -> dict
 # ── Basic Endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return RedirectResponse(url="/dashboard")
+    return RedirectResponse(url=ADMIN_LOGIN_PATH)
 
 
 @app.get("/health")
@@ -1086,7 +1098,7 @@ async def api_login(request: Request):
         token,
         max_age=SESSION_TTL,
         httponly=True,
-        secure=request.url.scheme == "https",
+        secure=bool(request.url.scheme == "https" or os.environ.get("RAILWAY_PUBLIC_DOMAIN")),
         samesite="lax",
         path="/",
     )
@@ -1169,6 +1181,8 @@ async def telegram_status(_=Depends(require_auth)):
 async def telegram_settings(request: Request, _=Depends(require_auth)):
     body = await request.json()
     token = str(body.get("token", "")).strip()
+    if not token:
+        token = str(BOT_SETTINGS.get("token", "")).strip()
     admin_ids = str(body.get("admin_ids", "")).strip()
     BOT_SETTINGS["token"] = token
     BOT_SETTINGS["admin_ids"] = admin_ids
@@ -1665,27 +1679,22 @@ async def public_sub_data(uuid_key: str, request: Request):
 
 
 # ── HTML Views ────────────────────────────────────────────────────────────────
-@app.get("/login", response_class=HTMLResponse)
+@app.get(ADMIN_LOGIN_PATH, response_class=HTMLResponse)
 async def login_page(request: Request):
     if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url="/dashboard")
+        return RedirectResponse(url=ADMIN_DASHBOARD_PATH)
 
-    from pages import LOGIN_HTML
-    alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-    cid = secrets.token_urlsafe(16)
-    code = "".join(secrets.choice(alphabet) for _ in range(5))
-    LOGIN_CAPTCHAS[cid] = (code, time.time() + 300)
-
-    html = LOGIN_HTML.replace("__CAPTCHA_ID__", cid).replace("__CAPTCHA_CODE__", code)
+    from pages import get_login_html
+    html = get_login_html(ADMIN_LOGIN_PATH, ADMIN_DASHBOARD_PATH)
     return HTMLResponse(content=html)
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
+@app.get(ADMIN_DASHBOARD_PATH, response_class=HTMLResponse)
 async def dashboard(request: Request):
     if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url="/login")
-    from pages import DASHBOARD_HTML
-    return HTMLResponse(content=DASHBOARD_HTML)
+        return RedirectResponse(url=ADMIN_LOGIN_PATH)
+    from pages import get_dashboard_html
+    return HTMLResponse(content=get_dashboard_html(ADMIN_LOGIN_PATH, ADMIN_DASHBOARD_PATH))
 
 
 # ── WebSocket & XHTTP Route Mounting ──────────────────────────────────────────
