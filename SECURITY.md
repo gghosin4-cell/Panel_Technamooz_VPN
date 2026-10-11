@@ -1,5 +1,0 @@
-# Security Policy
-
-برای اجرای عمومی Panel Technamooz v2، مقدارهای `ADMIN_PASSWORD`، `SECRET_KEY`، `ADMIN_PANEL_PATH`، `TELEGRAM_BOT_TOKEN` و `TELEGRAM_ADMIN_IDS` را فقط در Variables امن Railway یا secret manager قرار دهید و هرگز در repository commit نکنید. برنامه محیط Railway را با متغیرهای `RAILWAY_ENVIRONMENT_NAME`، `RAILWAY_ENVIRONMENT` یا `RAILWAY_PROJECT_ID` تشخیص می‌دهد؛ در این محیط نبودن `ADMIN_PASSWORD` باعث توقف عمدی و واضح برنامه می‌شود.
-
-رمز اولیهٔ توسعه `Technamooz` و نام کاربری اولیه `Amirparsa` فقط برای اجرای محلی هستند. در production مسیر `/login` عمداً بسته است و ورودی با مسیر خصوصی مشتق‌شده از secret یا `ADMIN_PANEL_PATH` انجام می‌شود. پس از اولین ورود، از بخش Security مشخصات ورود را تغییر دهید. CORS، اعتماد به `X-Forwarded-*` و اتصال relay به مقصدهای خصوصی به‌صورت پیش‌فرض محدود هستند و فقط باید با تنظیم صریح محیطی باز شوند. backup جدید hash رمز گروه‌ها و token ربات را export نمی‌کند. در صورت مشاهدهٔ مشکل امنیتی، اطلاعات حساس را در issue عمومی منتشر نکنید و از کانال پشتیبانی رسمی Technamooz استفاده کنید.
