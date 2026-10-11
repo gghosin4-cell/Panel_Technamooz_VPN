@@ -1,5 +1,13 @@
 # گزارش تغییرات نسخهٔ اصلاح‌شده Panel Technamooz Ultra Release
 
+## اصلاحات استقرار Railway
+
+- اصلاح `$schema` در `railway.json` به schema رسمی فعلی Railway.
+- افزودن `deploy.startCommand` صریح برای اجرای `python -m uvicorn main:app` روی `0.0.0.0:$PORT`.
+- مقاوم‌سازی `Procfile` با اجرای ماژولی Python و fallback پورت `8000` برای اجرای محلی.
+- تشخیص production با `RAILWAY_ENVIRONMENT_NAME` علاوه بر متغیرهای قدیمی Railway؛ نبودن `ADMIN_PASSWORD` در production با خطای واضح متوقف می‌شود.
+- مقاوم‌سازی خواندن `PORT` در برابر مقدار خالی.
+
 ## اصلاحات انجام‌شده
 
 - اصلاح فراخوانی تمدید کانفیگ و سازگار کردن endpoint با `renew_link_helper(days=...)`.

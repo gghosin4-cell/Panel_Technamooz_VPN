@@ -1,6 +1,6 @@
 # main.py
 # ══════════════════════════════════════════════════════════════════════════════
-# Panel Technamooz v2.0.0.0 Control Plane
+# Panel Technamooz v2.0.0 stable
 # پنل فوق‌حرفه‌ای و بهینه‌سازی‌شده ساخت و مدیریت کانفیگ VLESS / Trojan / XHTTP
 # توسعه‌یافته توسط تیم Technamooz با مدیریت amirparsa
 # ══════════════════════════════════════════════════════════════════════════════
@@ -9,19 +9,22 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import secrets
+import socket
 import sys
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
+import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -31,18 +34,14 @@ if __name__ == "__main__":
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [Technamooz] %(message)s")
 APP_NAME = "Panel Technamooz"
-APP_VERSION = "2.0.0.0"
+APP_VERSION = "2.0.0"
 logger = logging.getLogger("Technamooz")
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 app = FastAPI(title=f"{APP_NAME} v{APP_VERSION} stable", docs_url=None, redoc_url=None)
 
 # ── Persistence ───────────────────────────────────────────────────────────────
-IS_RAILWAY = bool(
-    os.environ.get("RAILWAY_ENVIRONMENT")
-    or os.environ.get("RAILWAY_ENVIRONMENT_NAME")
-    or os.environ.get("RAILWAY_PROJECT_ID")
-)
+IS_RAILWAY = any(os.environ.get(name) for name in ("RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME", "RAILWAY_PROJECT_ID"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data" if IS_RAILWAY else "./data"))
 DATA_FILE = DATA_DIR / "technamooz_state.json"
 SECRET_FILE = DATA_DIR / "technamooz_secret.key"
@@ -69,20 +68,22 @@ def _load_or_create_secret() -> str:
 
 
 CONFIG = {
-    "port": int(os.environ.get("PORT", 8000)),
+    "port": int(os.environ.get("PORT") or 8000),
     "secret": _load_or_create_secret(),
     "host": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
 }
 
-# The management UI is deliberately not exposed at a predictable `/admin` or
-# `/login` URL.  The segment is derived from a secret and is stable across
-# restarts as long as SECRET_KEY/ADMIN_PATH_SECRET remains stable.
-_admin_path_seed = os.environ.get("ADMIN_PATH_SECRET", "").strip() or CONFIG["secret"]
-_admin_path_digest = hmac.new(_admin_path_seed.encode(), b"technamooz-admin-route-v2", hashlib.sha256).digest()
-ADMIN_ROUTE_TOKEN = base64.urlsafe_b64encode(_admin_path_digest).decode().rstrip("=")[:24]
-ADMIN_ROUTE = f"/control/{ADMIN_ROUTE_TOKEN}"
-ADMIN_LOGIN_PATH = ADMIN_ROUTE
-ADMIN_DASHBOARD_PATH = f"{ADMIN_ROUTE}/dashboard"
+# The admin entry point is intentionally non-semantic.  It is derived from the
+# deployment secret, so it remains stable across restarts while never exposing a
+# predictable /admin or /login path in production.  ADMIN_PANEL_PATH can be set
+# explicitly when an operator wants to rotate the entry point.
+_admin_route_seed = os.environ.get("ADMIN_PANEL_PATH", "").strip().strip("/")
+if not _admin_route_seed:
+    _admin_route_seed = "pnl-" + hmac.new(CONFIG["secret"].encode(), b"technamooz-admin-entry", hashlib.sha256).hexdigest()[:32]
+ADMIN_PANEL_PATH = "/" + "".join(ch for ch in _admin_route_seed if ch.isalnum() or ch in "-_")
+if len(ADMIN_PANEL_PATH) < 12:
+    raise RuntimeError("ADMIN_PANEL_PATH must be a stable, high-entropy path segment")
+ALLOW_LEGACY_LOGIN_PATH = os.environ.get("ALLOW_LEGACY_LOGIN_PATH", "false").lower() in {"1", "true", "yes"}
 
 TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "false").lower() in {"1", "true", "yes"}
 ALLOWED_PUBLIC_HOSTS = {x.strip().split(":", 1)[0].lower() for x in os.environ.get("ALLOWED_PUBLIC_HOSTS", "").split(",") if x.strip()}
@@ -97,6 +98,18 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if request.url.scheme == "https" or IS_RAILWAY:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
+
 async def load_state():
     global LINKS, AUTH, SUBS
     try:
@@ -107,15 +120,7 @@ async def load_state():
             data = json.loads(raw)
             loaded_links = data.get("links", {})
             loaded_subs = data.get("subs", {})
-            # The bot token is intentionally never persisted to disk.  Keep a
-            # token supplied through the environment instead of overwriting it
-            # with the redacted empty token from a previous state save.
-            saved_telegram = data.get("telegram", {})
-            if isinstance(saved_telegram, dict):
-                for key in ("enabled", "admin_ids"):
-                    if key in saved_telegram:
-                        BOT_SETTINGS[key] = saved_telegram[key]
-            BOT_SETTINGS["enabled"] = bool(BOT_SETTINGS.get("token")) and bool(BOT_SETTINGS.get("enabled"))
+            BOT_SETTINGS.update(data.get("telegram", {}))
 
             for item in loaded_links.values():
                 if item.get("protocol") == "xhttp-stream-one":
@@ -137,7 +142,6 @@ async def save_state():
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             data = {
-                "schema_version": 2,
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
                 "password_hash": AUTH["password_hash"],
@@ -302,12 +306,11 @@ async def startup():
     http_client = httpx.AsyncClient(timeout=10.0)
     await load_state()
     await ensure_default_link()
-    logger.info("Technamooz Control Plane admin URL: %s", ADMIN_LOGIN_PATH)
 
     from xhttp_siz10 import ensure_reaper
     ensure_reaper()
 
-    if BOT_SETTINGS.get("token") and BOT_SETTINGS.get("enabled"):
+    if BOT_SETTINGS.get("token"):
         try:
             from telegram_bot import start_bot
             asyncio.create_task(start_bot())
@@ -460,23 +463,6 @@ def normalize_port(value) -> int:
     except (TypeError, ValueError):
         return DEFAULT_PORT
     return port if MIN_PORT <= port <= MAX_PORT else DEFAULT_PORT
-
-
-def parse_request_float(value, field: str, default: float = 0.0) -> float:
-    try:
-        result = default if value is None or value == "" else float(value)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail=f"مقدار {field} نامعتبر است")
-    if result != result or result in (float("inf"), float("-inf")):
-        raise HTTPException(status_code=400, detail=f"مقدار {field} نامعتبر است")
-    return result
-
-
-def parse_request_int(value, field: str, default: int = 0) -> int:
-    try:
-        return default if value is None or value == "" else int(value)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail=f"مقدار {field} نامعتبر است")
 
 
 def is_link_expired(link: dict) -> bool:
@@ -660,7 +646,7 @@ def generate_clash_meta_yaml(links_list: list[tuple[str, dict]], host: str, prof
         fp = link.get("fingerprint") or "chrome"
 
         if proto == "trojan-ws":
-            proxies_yaml.append(f"""  - name: {json.dumps(name, ensure_ascii=False)}
+            proxies_yaml.append(f"""  - name: "{name}"
     type: trojan
     server: {server}
     port: {port}
@@ -674,7 +660,7 @@ def generate_clash_meta_yaml(links_list: list[tuple[str, dict]], host: str, prof
       headers:
         Host: {host}""")
         elif proto == "vless-ws":
-            proxies_yaml.append(f"""  - name: {json.dumps(name, ensure_ascii=False)}
+            proxies_yaml.append(f"""  - name: "{name}"
     type: vless
     server: {server}
     port: {port}
@@ -691,7 +677,7 @@ def generate_clash_meta_yaml(links_list: list[tuple[str, dict]], host: str, prof
         else:
             # XHTTP
             mode = proto.replace("xhttp-", "")
-            proxies_yaml.append(f"""  - name: {json.dumps(name, ensure_ascii=False)}
+            proxies_yaml.append(f"""  - name: "{name}"
     type: vless
     server: {server}
     port: {port}
@@ -708,9 +694,7 @@ def generate_clash_meta_yaml(links_list: list[tuple[str, dict]], host: str, prof
 """)
 
     proxies_str = "\n".join(proxies_yaml) if proxies_yaml else "  []"
-    quoted_names = "\n".join(
-        f"      - {json.dumps(n, ensure_ascii=False)}" for n in proxy_names
-    )
+    quoted_names = "\n".join(f"      - \"{n}\"" for n in proxy_names)
 
     return f"""# Generated by Panel Technamooz v1.0.0.0 stable
 # Community: https://t.me/technamooz | Website: https://technamooz.ir
@@ -844,7 +828,7 @@ def generate_singbox_json(links_list: list[tuple[str, dict]], host: str) -> dict
 # ── Basic Endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return RedirectResponse(url=ADMIN_LOGIN_PATH)
+    return RedirectResponse(url=ADMIN_PANEL_PATH)
 
 
 @app.get("/health")
@@ -889,11 +873,19 @@ async def system_info(_=Depends(require_auth)):
 @app.get("/api/backup")
 async def download_backup(_=Depends(require_auth)):
     async with LINKS_LOCK, SUBS_LOCK:
+        safe_subs = {}
+        for sid, sub in SUBS.items():
+            safe_sub = dict(sub)
+            # Password hashes are verifier material, not backup data.  Exporting
+            # them would turn an otherwise safe admin backup into a credential
+            # recovery artifact.
+            safe_sub.pop("password_hash", None)
+            safe_subs[sid] = safe_sub
         data = {
             "version": APP_VERSION,
             "exported_at": datetime.now().isoformat(),
             "links": dict(LINKS),
-            "subs": dict(SUBS),
+            "subs": safe_subs,
             "telegram": {k: v for k, v in BOT_SETTINGS.items() if k != "token"},
             "author": "Technamooz (amirparsa)",
         }
@@ -1098,7 +1090,7 @@ async def api_login(request: Request):
         token,
         max_age=SESSION_TTL,
         httponly=True,
-        secure=bool(request.url.scheme == "https" or os.environ.get("RAILWAY_PUBLIC_DOMAIN")),
+        secure=(request.url.scheme == "https" or IS_RAILWAY),
         samesite="lax",
         path="/",
     )
@@ -1181,8 +1173,6 @@ async def telegram_status(_=Depends(require_auth)):
 async def telegram_settings(request: Request, _=Depends(require_auth)):
     body = await request.json()
     token = str(body.get("token", "")).strip()
-    if not token:
-        token = str(BOT_SETTINGS.get("token", "")).strip()
     admin_ids = str(body.get("admin_ids", "")).strip()
     BOT_SETTINGS["token"] = token
     BOT_SETTINGS["admin_ids"] = admin_ids
@@ -1190,12 +1180,8 @@ async def telegram_settings(request: Request, _=Depends(require_auth)):
     await save_state()
 
     try:
-        if BOT_SETTINGS["enabled"]:
-            from telegram_bot import configure_bot
-            await configure_bot(token, admin_ids)
-        else:
-            from telegram_bot import stop_bot
-            await stop_bot()
+        from telegram_bot import configure_bot
+        await configure_bot(token, admin_ids)
     except Exception as e:
         logger.warning(f"Could not configure Telegram bot: {e}")
 
@@ -1301,10 +1287,6 @@ async def make_link(
     fp = (fingerprint or DEFAULT_FINGERPRINT).strip()
     if fp not in FINGERPRINTS:
         fp = DEFAULT_FINGERPRINT
-    if sub_id:
-        async with SUBS_LOCK:
-            if sub_id not in SUBS:
-                raise HTTPException(status_code=400, detail="گروه اشتراک یافت نشد")
 
     link_data = {
         "label": label or "کانفیگ Technamooz",
@@ -1377,17 +1359,17 @@ async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
     uid, link_data = await make_link(
         label=str(body.get("label", "کانفیگ جدید")).strip(),
-        limit_value=parse_request_float(body.get("limit_value", 0), "limit_value"),
+        limit_value=float(body.get("limit_value", 0) or 0),
         limit_unit=str(body.get("limit_unit", "GB")),
-        expires_days=parse_request_float(body.get("expires_days", 0), "expires_days"),
+        expires_days=float(body.get("expires_days", 0) or 0),
         note=str(body.get("note", "")).strip(),
         sub_id=body.get("sub_id") or None,
         protocol=str(body.get("protocol", DEFAULT_PROTOCOL)),
         fingerprint=body.get("fingerprint"),
         alpn=body.get("alpn"),
-        port=parse_request_int(body.get("port", DEFAULT_PORT), "port", DEFAULT_PORT),
-        ip_limit=parse_request_int(body.get("ip_limit", 0), "ip_limit"),
-        speed_limit_value=parse_request_float(body.get("speed_limit_value", 0), "speed_limit_value"),
+        port=int(body.get("port", DEFAULT_PORT) or DEFAULT_PORT),
+        ip_limit=int(body.get("ip_limit", 0) or 0),
+        speed_limit_value=float(body.get("speed_limit_value", 0) or 0),
         speed_limit_unit=str(body.get("speed_limit_unit", "Mbps")),
         clean_ip=str(body.get("clean_ip", "")).strip(),
     )
@@ -1439,11 +1421,11 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
         if "reset_usage" in body and body["reset_usage"]:
             link["used_bytes"] = 0
         if "limit_value" in body:
-            val = parse_request_float(body["limit_value"], "limit_value")
+            val = float(body["limit_value"] or 0)
             unit = body.get("limit_unit", "GB")
             link["limit_bytes"] = parse_size_to_bytes(val, unit) if val > 0 else 0
         if "expires_days" in body:
-            days = parse_request_float(body["expires_days"], "expires_days")
+            days = float(body["expires_days"] or 0)
             link["expires_at"] = (now_ir() + timedelta(days=days)).isoformat() if days > 0 else None
         if "protocol" in body:
             proto = body["protocol"]
@@ -1458,9 +1440,9 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
         if "port" in body:
             link["port"] = normalize_port(body["port"])
         if "ip_limit" in body:
-            link["ip_limit"] = max(0, parse_request_int(body["ip_limit"], "ip_limit"))
+            link["ip_limit"] = max(0, int(body["ip_limit"] or 0))
         if "speed_limit_value" in body:
-            sval = parse_request_float(body["speed_limit_value"], "speed_limit_value")
+            sval = float(body["speed_limit_value"] or 0)
             sunit = body.get("speed_limit_unit", "Mbps")
             link["speed_limit_bytes"] = parse_speed_to_bytes(sval, sunit) if sval > 0 else 0
             from speed_limit import reset_bucket
@@ -1594,26 +1576,22 @@ async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_au
     link_id = body.get("link_id")
     action = body.get("action", "add")
 
-    if action not in {"add", "remove"}:
-        raise HTTPException(status_code=400, detail="عملیات نامعتبر است")
-    if not isinstance(link_id, str):
-        raise HTTPException(status_code=400, detail="شناسه کانفیگ نامعتبر است")
     async with SUBS_LOCK:
-        if sub_id not in SUBS:
+        sub = SUBS.get(sub_id)
+        if not sub:
             raise HTTPException(status_code=404, detail="گروه یافت نشد")
-    async with LINKS_LOCK:
-        if link_id not in LINKS:
-            raise HTTPException(status_code=404, detail="کانفیگ یافت نشد")
-
-    # Use the canonical helper so both sides of the relationship stay in sync.
-    if action == "add":
-        ok = await set_link_sub(link_id, sub_id)
-    else:
+        if not isinstance(link_id, str):
+            raise HTTPException(status_code=400, detail="شناسه کانفیگ نامعتبر است")
         async with LINKS_LOCK:
-            belongs_to_group = LINKS[link_id].get("sub_id") == sub_id
-        ok = await set_link_sub(link_id, None) if belongs_to_group else True
-    if not ok:
-        raise HTTPException(status_code=409, detail="همگام‌سازی گروه انجام نشد")
+            if link_id not in LINKS:
+                raise HTTPException(status_code=404, detail="کانفیگ یافت نشد")
+        lids = sub.setdefault("link_ids", [])
+        if action == "add" and link_id not in lids:
+            lids.append(link_id)
+        elif action == "remove" and link_id in lids:
+            lids.remove(link_id)
+
+    await save_state()
     return {"ok": True}
 
 
@@ -1679,34 +1657,44 @@ async def public_sub_data(uuid_key: str, request: Request):
 
 
 # ── HTML Views ────────────────────────────────────────────────────────────────
-@app.get(ADMIN_LOGIN_PATH, response_class=HTMLResponse)
-async def login_page(request: Request):
+async def _render_login_page(request: Request):
     if await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url=ADMIN_DASHBOARD_PATH)
+        return RedirectResponse(url="/dashboard")
 
-    from pages import get_login_html
-    html = get_login_html(ADMIN_LOGIN_PATH, ADMIN_DASHBOARD_PATH)
+    from pages import LOGIN_HTML
+    alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    cid = secrets.token_urlsafe(16)
+    code = "".join(secrets.choice(alphabet) for _ in range(5))
+    LOGIN_CAPTCHAS[cid] = (code, time.time() + 300)
+
+    html = LOGIN_HTML.replace("__CAPTCHA_ID__", cid).replace("__CAPTCHA_CODE__", code)
     return HTMLResponse(content=html)
 
 
-@app.get(ADMIN_DASHBOARD_PATH, response_class=HTMLResponse)
+@app.get(ADMIN_PANEL_PATH, response_class=HTMLResponse)
+async def private_login_page(request: Request):
+    return await _render_login_page(request)
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def legacy_login_page(request: Request):
+    if not ALLOW_LEGACY_LOGIN_PATH and IS_RAILWAY:
+        raise HTTPException(status_code=404, detail="Not found")
+    return await _render_login_page(request)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
     if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url=ADMIN_LOGIN_PATH)
-    from pages import get_dashboard_html
-    return HTMLResponse(content=get_dashboard_html(ADMIN_LOGIN_PATH, ADMIN_DASHBOARD_PATH))
+        return RedirectResponse(url=ADMIN_PANEL_PATH)
+    from pages import DASHBOARD_HTML
+    return HTMLResponse(content=DASHBOARD_HTML.replace("__ADMIN_PATH__", ADMIN_PANEL_PATH))
 
 
 # ── WebSocket & XHTTP Route Mounting ──────────────────────────────────────────
-# Import the relay lazily so importing relay_vless or xhttp_siz10 directly does
-# not create a partially-initialized ``main``/``relay_vless`` circular import.
-async def websocket_tunnel_entry(ws, uuid: str):
-    from relay_vless import websocket_tunnel
-    return await websocket_tunnel(ws, uuid)
-
-
-app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel_entry)
-app.add_api_websocket_route("/trojan/{uuid}", websocket_tunnel_entry)
+from relay_vless import websocket_tunnel
+app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
+app.add_api_websocket_route("/trojan/{uuid}", websocket_tunnel)
 
 from xhttp_siz10 import router as xhttp_router
 app.include_router(xhttp_router)

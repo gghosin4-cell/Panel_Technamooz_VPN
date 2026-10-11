@@ -63,6 +63,14 @@
 
 ## آزمون‌های انجام‌شده
 
+### ممیزی و اصلاح استقرار Railway
+
+- schema قدیمی `railway.app/industry-standard-schema.json` با schema رسمی `railway.com/railway.schema.json` جایگزین شد.
+- `deploy.startCommand` صریح برای اجرای Uvicorn روی `0.0.0.0:$PORT` اضافه شد.
+- `Procfile` به اجرای `python -m uvicorn` با fallback پورت محلی تغییر کرد.
+- تشخیص production با `RAILWAY_ENVIRONMENT_NAME`، `RAILWAY_ENVIRONMENT` و `RAILWAY_PROJECT_ID` پوشش داده شد.
+- clean install از `requirements.txt`، import، healthcheck، login، API احراز هویت و ساخت کانفیگ با موفقیت اجرا شد.
+
 - `python -m compileall`: موفق برای همهٔ فایل‌های Python.
 - AST parse: موفق برای `main.py`, `pages.py`, `relay_vless.py`, `speed_limit.py`, `telegram_bot.py`, `xhttp_siz10.py`.
 - import برنامه و ثبت routeها: موفق؛ 45 route پس از اضافه‌شدن endpoint سازگار.

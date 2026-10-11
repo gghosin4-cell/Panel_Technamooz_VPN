@@ -1096,16 +1096,7 @@ async def stop_bot():
 
 
 def get_bot_status() -> dict:
-    from main import BOT_SETTINGS
-    token_configured = bool(BOT_SETTINGS.get("token"))
-    return {
-        "enabled": bool(BOT_SETTINGS.get("enabled")) and token_configured,
-        "configured": token_configured,
-        "running": bool(_running),
-        "polling": bool(_poll_task and not _poll_task.done()),
-        "admins_count": len(ADMIN_IDS),
-        "admin_ids": BOT_SETTINGS.get("admin_ids", ""),
-    }
+    return {"running": bool(_running), "polling": bool(_poll_task and not _poll_task.done()), "admins_count": len(ADMIN_IDS)}
 
 
 async def configure_bot(token: str, admin_ids: str) -> None:
