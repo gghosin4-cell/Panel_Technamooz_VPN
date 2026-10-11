@@ -7,12 +7,8 @@
 
 import asyncio
 import hashlib
-import hmac
-import ipaddress
-import os
 import secrets
 import socket
-import uuid as uuidlib
 from datetime import datetime
 from fastapi import WebSocket, WebSocketDisconnect
 from main import (
@@ -27,7 +23,6 @@ from main import (
     now_ir,
     save_state,
     stats,
-    TRUST_PROXY_HEADERS,
 )
 from speed_limit import is_ip_within_limit, record_ip_active, throttle
 
@@ -35,53 +30,24 @@ RELAY_BUF = 256 * 1024  # 256 KB high-throughput buffer
 
 
 def _ws_client_ip(ws: WebSocket) -> str:
-    if TRUST_PROXY_HEADERS:
-        cf_ip = ws.headers.get("cf-connecting-ip")
-        if cf_ip:
-            return cf_ip.strip()
-        fwd = ws.headers.get("x-forwarded-for")
-        if fwd:
-            return fwd.split(",")[0].strip()
-        real_ip = ws.headers.get("x-real-ip")
-        if real_ip:
-            return real_ip.strip()
+    cf_ip = ws.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+    fwd = ws.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    real_ip = ws.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
     return ws.client.host if ws.client else "نامشخص"
 
 
-async def open_public_connection(host: str, port: int, timeout: float = 10.0):
-    """Resolve and connect only to public addresses to prevent relay SSRF."""
-    if os.environ.get("ALLOW_PRIVATE_TARGETS", "false").lower() in {"1", "true", "yes"}:
-        return await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-
-    loop = asyncio.get_running_loop()
-    infos = await loop.run_in_executor(None, socket.getaddrinfo, host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
-    candidates = []
-    for family, socktype, proto, _, sockaddr in infos:
-        addr = ipaddress.ip_address(sockaddr[0])
-        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
-            continue
-        candidates.append((family, sockaddr))
-    if not candidates:
-        raise ValueError("target resolves to a non-public address")
-    family, sockaddr = candidates[0]
-    return await asyncio.wait_for(asyncio.open_connection(sockaddr[0], sockaddr[1], family=family), timeout=timeout)
-
-
-async def parse_vless_header(chunk: bytes, expected_uuid: str | None = None):
+async def parse_vless_header(chunk: bytes):
     """
     آنپک کردن هدر استاندارد VLESS
     """
     if len(chunk) < 24:
         raise ValueError("chunk too small for VLESS")
-    if chunk[0] != 1:
-        raise ValueError("unsupported VLESS version")
-    if expected_uuid is not None:
-        try:
-            expected_bytes = uuidlib.UUID(expected_uuid).bytes
-        except (ValueError, AttributeError):
-            raise ValueError("invalid expected UUID")
-        if not hmac.compare_digest(chunk[1:17], expected_bytes):
-            raise ValueError("VLESS UUID mismatch")
     pos = 1
     pos += 16  # UUID
     addon_len = chunk[pos]
@@ -122,8 +88,10 @@ async def parse_trojan_header(chunk: bytes, expected_uuid: str):
     expected_hash = hashlib.sha224(expected_uuid.encode()).hexdigest().lower()
     recv_hash = chunk[:56].decode("ascii", errors="ignore").lower()
 
-    if not hmac.compare_digest(recv_hash, expected_hash):
-        raise ValueError("Trojan authentication hash mismatch")
+    if recv_hash != expected_hash:
+        # Also allow matching raw UUID if formatted that way
+        if chunk[:36].decode("ascii", errors="ignore").lower() != expected_uuid.lower():
+            raise ValueError("Trojan authentication hash mismatch")
 
     pos = 56
     if chunk[pos:pos + 2] == b"\r\n":
@@ -286,9 +254,18 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         is_trojan = is_trojan_link
         # Try unpacking as Trojan if link is Trojan, else VLESS
         if is_trojan:
-            command, address, port, payload = await parse_trojan_header(first_chunk, uuid)
+            try:
+                command, address, port, payload = await parse_trojan_header(first_chunk, uuid)
+            except Exception:
+                # Fallback to VLESS unpack
+                command, address, port, payload = await parse_vless_header(first_chunk)
+                is_trojan = False
         else:
-            command, address, port, payload = await parse_vless_header(first_chunk, uuid)
+            try:
+                command, address, port, payload = await parse_vless_header(first_chunk)
+            except Exception:
+                command, address, port, payload = await parse_trojan_header(first_chunk, uuid)
+                is_trojan = True
 
         if not await check_and_use(uuid, len(first_chunk)):
             await ws.close(code=1008, reason="quota/disabled")
@@ -299,9 +276,10 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         connections[conn_id]["bytes"] += len(first_chunk)
         logger.info(f"➡️ [Technamooz] [{conn_id}] → {address}:{port} ({'Trojan' if is_trojan else 'VLESS'})")
 
-        if command != 1:
-            raise ValueError("only TCP relay commands are supported")
-        reader, writer = await open_public_connection(address, port)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(address, port),
+            timeout=10.0,
+        )
         _tune_socket_tcp(writer)
 
         if payload:

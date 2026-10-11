@@ -25,29 +25,11 @@ from main import (
     logger,
     save_state,
     stats,
-    TRUST_PROXY_HEADERS,
 )
+from relay_vless import check_and_use, parse_vless_header
 from speed_limit import record_ip_active, throttle
 
 router = APIRouter()
-
-
-# Keep relay imports lazy.  This module is imported by main, while the relay
-# module also imports shared state from main; eager imports here make direct
-# ``import relay_vless`` fail with a partially initialized module.
-async def check_and_use(uid: str, n: int) -> bool:
-    from relay_vless import check_and_use as _check_and_use
-    return await _check_and_use(uid, n)
-
-
-async def open_public_connection(host: str, port: int, timeout: float = 10.0):
-    from relay_vless import open_public_connection as _open_public_connection
-    return await _open_public_connection(host, port, timeout)
-
-
-async def parse_vless_header(chunk: bytes, expected_uuid: str | None = None):
-    from relay_vless import parse_vless_header as _parse_vless_header
-    return await _parse_vless_header(chunk, expected_uuid)
 
 XHTTP_BUF = 512 * 1024
 DOWNLINK_QUEUE_MAX = 512
@@ -186,22 +168,20 @@ class _AdaptiveFlow:
 
 
 def _req_client_ip(request: Request) -> str:
-    if TRUST_PROXY_HEADERS:
-        fwd = request.headers.get("x-forwarded-for")
-        if fwd:
-            return fwd.split(",")[0].strip()
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            return real_ip.strip()
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
     return request.client.host if request.client else "نامشخص"
 
 
-async def _open_tcp_from_header(first_chunk: bytes, expected_uuid: str):
-    """Parse the first VLESS packet and open its validated public target."""
-    command, address, port, payload = await parse_vless_header(first_chunk, expected_uuid)
-    if command != 1:
-        raise ValueError("only TCP relay commands are supported")
-    reader, writer = await open_public_connection(address, port, timeout=TCP_CONNECT_TIMEOUT)
+async def _open_tcp_from_header(first_chunk: bytes):
+    command, address, port, payload = await parse_vless_header(first_chunk)
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(address, port), timeout=TCP_CONNECT_TIMEOUT
+    )
     _tune_socket(writer)
     if payload:
         writer.write(payload)
@@ -337,7 +317,7 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
 
 async def _open_tcp_for_session(session_id: str, uuid: str, sess: dict, first_chunk: bytes):
     """تونل TCP رو از روی هدر VLESS باز می‌کنه و پمپ دانلینک رو راه می‌اندازه."""
-    reader, writer, address, port = await _open_tcp_from_header(first_chunk, uuid)
+    reader, writer, address, port = await _open_tcp_from_header(first_chunk)
     logger.info(f"connect XHTTP[{sess['mode']}] [{session_id[:8]}] -> {address}:{port}")
     sess["writer"] = writer
     sess["tcp_open"] = True

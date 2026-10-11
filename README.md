@@ -84,13 +84,6 @@
    ```
 5. هلث‌چک پروژه روی آدرس `/health` به صورت فعال نظارت می‌کند.
 
-### الزامات امنیتی نسخهٔ hardened
-
-- در محیط Railway، متغیر `ADMIN_PASSWORD` اجباری است و برنامه بدون آن اجرا نمی‌شود؛ رمز توسعهٔ `Technamooz` فقط برای اجرای محلی است.
-- برای تولید URL صحیح، `RAILWAY_PUBLIC_DOMAIN` یا `ALLOWED_PUBLIC_HOSTS` را تنظیم کنید. مقدار `TRUST_PROXY_HEADERS` فقط زمانی فعال شود که برنامه پشت reverse proxy مورد اعتماد است.
-- CORS به‌صورت پیش‌فرض غیرفعال است؛ در صورت نیاز، originهای دقیق را در `CORS_ORIGINS` با کاما جدا کنید و از wildcard استفاده نکنید.
-- relay به مقصدهای private/loopback/link-local متصل نمی‌شود. فقط در شبکهٔ کاملاً کنترل‌شده و با آگاهی از ریسک، `ALLOW_PRIVATE_TARGETS=true` را فعال کنید.
-
 ---
 
 ## 💻 راه‌اندازی محلی (Local Development)
